@@ -126,6 +126,7 @@ struct __attribute__((packed)) Meta {
 static Config        g_cfg;
 static portMUX_TYPE  g_cfg_mux  = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool g_cfg_dirty = false;
+static uint32_t      g_cfg_gen   = 0;
 static uint64_t      g_last_save_ms   = 0;
 static uint64_t      g_first_dirty_ms = 0;
 
@@ -147,7 +148,8 @@ struct __attribute__((packed)) Snapshot {
   uint8_t  bh_ok;
   uint8_t  relay_on;
   uint8_t  valid;
-  uint8_t  pad;
+  uint8_t  adc_fault;
+  uint8_t  pad[3];
   uint64_t ts_us;
 };
 static Snapshot       g_snap;
@@ -233,6 +235,12 @@ static void cfg_defaults(Config& c) {
   c.rain_wet = RAIN_WET_DEF;
 }
 
+static int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
 static void cfg_sanitize(Config& c) {
   if (c.sample_interval_ms < SAMPLE_MIN_MS) c.sample_interval_ms = SAMPLE_MIN_MS;
   if (c.sample_interval_ms > SAMPLE_MAX_MS) c.sample_interval_ms = SAMPLE_MAX_MS;
@@ -248,11 +256,33 @@ static void cfg_sanitize(Config& c) {
   if (c.mq2_dirty > ADC_MAX) c.mq2_dirty = ADC_MAX;
   if (c.rain_dry > ADC_MAX) c.rain_dry = ADC_MAX;
   if (c.rain_wet > ADC_MAX) c.rain_wet = ADC_MAX;
+
+  c.temp_off_x10 = clamp_i32(c.temp_off_x10, -500, 500);
+  c.hum_off_x10  = clamp_i32(c.hum_off_x10,  -500, 500);
+  c.pres_off_pa  = clamp_i32(c.pres_off_pa,  -5000, 5000);
+  c.lux_off_x10  = clamp_i32(c.lux_off_x10,  -5000, 5000);
+
+  if (c.soil_dry < c.soil_wet) {
+    uint32_t t = c.soil_dry; c.soil_dry = c.soil_wet; c.soil_wet = t;
+  }
+  if (c.mq2_clean > c.mq2_dirty) {
+    uint32_t t = c.mq2_clean; c.mq2_clean = c.mq2_dirty; c.mq2_dirty = t;
+  }
+  if (c.rain_dry < c.rain_wet) {
+    uint32_t t = c.rain_dry; c.rain_dry = c.rain_wet; c.rain_wet = t;
+  }
+
   c.ap_ssid[32] = 0;
   c.ap_pass[64] = 0;
-  if (c.ap_ssid[0] == 0) strncpy(c.ap_ssid, DEF_AP_SSID, sizeof(c.ap_ssid) - 1);
+  if (c.ap_ssid[0] == 0) {
+    memset(c.ap_ssid, 0, sizeof(c.ap_ssid));
+    strncpy(c.ap_ssid, DEF_AP_SSID, sizeof(c.ap_ssid) - 1);
+  }
   size_t pl = strlen(c.ap_pass);
-  if (pl < 8) strncpy(c.ap_pass, DEF_AP_PASS, sizeof(c.ap_pass) - 1);
+  if (pl < 8) {
+    memset(c.ap_pass, 0, sizeof(c.ap_pass));
+    strncpy(c.ap_pass, DEF_AP_PASS, sizeof(c.ap_pass) - 1);
+  }
   if (pl > 63) c.ap_pass[63] = 0;
 }
 
@@ -263,6 +293,9 @@ static bool nvs_load() {
   Preferences p;
   if (!p.begin(NVS_NAMESPACE, true)) {
     cfg_defaults(g_cfg);
+    cfg_sanitize(g_cfg);
+    nvs_mark_dirty();
+    g_boot_count++;
     return false;
   }
   Meta m;
@@ -303,8 +336,8 @@ static bool nvs_load() {
     cfg_sanitize(g_cfg);
   } else {
     cfg_defaults(g_cfg);
-    g_cfg_dirty = true;
-    g_first_dirty_ms = millis64();
+    cfg_sanitize(g_cfg);
+    nvs_mark_dirty();
   }
   g_boot_count++;
   return cfg_ok;
@@ -312,8 +345,10 @@ static bool nvs_load() {
 
 static bool nvs_save() {
   Config cfg_copy;
+  uint32_t gen_at_copy;
   portENTER_CRITICAL(&g_cfg_mux);
   cfg_copy = g_cfg;
+  gen_at_copy = g_cfg_gen;
   portEXIT_CRITICAL(&g_cfg_mux);
   cfg_sanitize(cfg_copy);
 
@@ -333,12 +368,18 @@ static bool nvs_save() {
   bool ok2 = (p.putBytes(NVS_KEY_META, &m, sizeof(m)) == sizeof(m));
   p.end();
 
-  if (ok1 && ok2) {
-    g_save_count++;
-    g_last_save_ms = millis64();
+  if (!(ok1 && ok2)) return false;
+
+  g_save_count++;
+  g_last_save_ms = millis64();
+
+  portENTER_CRITICAL(&g_cfg_mux);
+  if (g_cfg_gen == gen_at_copy) {
     g_cfg_dirty = false;
   }
-  return ok1 && ok2;
+  portEXIT_CRITICAL(&g_cfg_mux);
+
+  return true;
 }
 
 static void nvs_mark_dirty() {
@@ -347,14 +388,21 @@ static void nvs_mark_dirty() {
     g_cfg_dirty = true;
     g_first_dirty_ms = millis64();
   }
+  g_cfg_gen++;
   portEXIT_CRITICAL(&g_cfg_mux);
 }
 
 static void nvs_tick() {
-  if (!g_cfg_dirty) return;
+  bool dirty;
+  uint64_t first_dirty;
+  portENTER_CRITICAL(&g_cfg_mux);
+  dirty = g_cfg_dirty;
+  first_dirty = g_first_dirty_ms;
+  portEXIT_CRITICAL(&g_cfg_mux);
+  if (!dirty) return;
   uint64_t now = millis64();
   uint64_t since_last  = now - g_last_save_ms;
-  uint64_t since_first = now - g_first_dirty_ms;
+  uint64_t since_first = now - first_dirty;
   if (since_last >= NVS_SAVE_MIN_GAP_MS || since_first >= NVS_SAVE_MAX_DEFER_MS) {
     nvs_save();
   }
@@ -442,44 +490,46 @@ static int32_t sat_i32(int64_t v, int32_t lo, int32_t hi) {
 /* ------------------------------------------------------------------ */
 /* Relay driver                                                       */
 /* ------------------------------------------------------------------ */
-static void relay_apply_locked(bool on) {
+static void relay_apply_locked(const Config& cfg, bool on) {
   bool level = on;
-  if (g_cfg.relay_invert) level = !level;
+  if (cfg.relay_invert) level = !level;
   digitalWrite(PIN_RELAY, level ? HIGH : LOW);
   g_relay_state = on;
   if (on) g_relay_on_us = (uint64_t)esp_timer_get_time();
 }
 
-static void relay_apply(bool on) {
-  portENTER_CRITICAL(&g_relay_mux);
-  relay_apply_locked(on);
-  portEXIT_CRITICAL(&g_relay_mux);
-}
-
-static void relay_update(uint16_t soil_adc, uint16_t mq2_adc, uint8_t rain_pct) {
-  portENTER_CRITICAL(&g_relay_mux);
-  uint32_t mode = g_cfg.relay_mode;
-  if (mode == 0) { if (g_relay_state) relay_apply_locked(false); portEXIT_CRITICAL(&g_relay_mux); return; }
-  if (mode == 2) { if (!g_relay_state) relay_apply_locked(true); portEXIT_CRITICAL(&g_relay_mux); return; }
-  if (mode == 3) { if (g_relay_state) relay_apply_locked(false); portEXIT_CRITICAL(&g_relay_mux); return; }
+static void relay_update_locked(const Config& cfg, uint16_t soil_adc, uint16_t mq2_adc,
+                                uint8_t rain_pct, bool rule_ok) {
+  uint32_t mode = cfg.relay_mode;
+  if (mode == 0) { if (g_relay_state) relay_apply_locked(cfg, false); return; }
+  if (mode == 2) { if (!g_relay_state) relay_apply_locked(cfg, true); return; }
+  if (mode == 3) { if (g_relay_state) relay_apply_locked(cfg, false); return; }
 
   bool want = false;
-  uint32_t rule = g_cfg.relay_rule;
-  if (rule == 0)      want = (uint64_t)soil_adc > (uint64_t)g_cfg.relay_threshold;
-  else if (rule == 1) want = (uint64_t)soil_adc < (uint64_t)g_cfg.relay_threshold;
-  else if (rule == 2) want = (uint64_t)mq2_adc  > (uint64_t)g_cfg.relay_threshold;
-  else if (rule == 3) want = (uint64_t)rain_pct > (uint64_t)g_cfg.relay_rain_pct;
+  if (rule_ok) {
+    uint32_t rule = cfg.relay_rule;
+    if (rule == 0)      want = (uint64_t)soil_adc > (uint64_t)cfg.relay_threshold;
+    else if (rule == 1) want = (uint64_t)soil_adc < (uint64_t)cfg.relay_threshold;
+    else if (rule == 2) want = (uint64_t)mq2_adc  > (uint64_t)cfg.relay_threshold;
+    else if (rule == 3) want = (uint64_t)rain_pct > (uint64_t)cfg.relay_rain_pct;
+  }
 
   if (want) {
-    if (!g_relay_state) relay_apply_locked(true);
+    if (!g_relay_state) relay_apply_locked(cfg, true);
   } else {
     if (g_relay_state) {
       uint64_t held = (uint64_t)esp_timer_get_time() - g_relay_on_us;
-      if (g_cfg.relay_min_on_ms == 0 || held >= (uint64_t)g_cfg.relay_min_on_ms * 1000ULL) {
-        relay_apply_locked(false);
+      if (cfg.relay_min_on_ms == 0 || held >= (uint64_t)cfg.relay_min_on_ms * 1000ULL) {
+        relay_apply_locked(cfg, false);
       }
     }
   }
+}
+
+static void relay_update(const Config& cfg, uint16_t soil_adc, uint16_t mq2_adc,
+                         uint8_t rain_pct, bool rule_ok) {
+  portENTER_CRITICAL(&g_relay_mux);
+  relay_update_locked(cfg, soil_adc, mq2_adc, rain_pct, rule_ok);
   portEXIT_CRITICAL(&g_relay_mux);
 }
 
@@ -488,11 +538,11 @@ static void relay_update(uint16_t soil_adc, uint16_t mq2_adc, uint8_t rain_pct) 
 /* ------------------------------------------------------------------ */
 static void sample_tick() {
   uint64_t now = (uint64_t)esp_timer_get_time();
-  uint32_t interval_ms;
+  Config cfg;
   portENTER_CRITICAL(&g_cfg_mux);
-  interval_ms = g_cfg.sample_interval_ms;
+  cfg = g_cfg;
   portEXIT_CRITICAL(&g_cfg_mux);
-  if ((now - g_last_sample_us) < (uint64_t)interval_ms * 1000ULL) return;
+  if ((now - g_last_sample_us) < (uint64_t)cfg.sample_interval_ms * 1000ULL) return;
   g_last_sample_us = now;
 
   if (!g_bme_ok) {
@@ -531,9 +581,9 @@ static void sample_tick() {
     float h = g_bme.readHumidity();
     float p = g_bme.readPressure();
     if (!isnan(t) && !isnan(h) && !isnan(p) && h >= 0.0f && h <= 100.0f && t > -40.0f && t < 85.0f) {
-      int64_t tx = (int64_t)lroundf(t * 10.0f) + g_cfg.temp_off_x10;
-      int64_t hx = (int64_t)lroundf(h * 10.0f) + g_cfg.hum_off_x10;
-      int64_t px = (int64_t)lroundf(p) + g_cfg.pres_off_pa;
+      int64_t tx = (int64_t)lroundf(t * 10.0f) + cfg.temp_off_x10;
+      int64_t hx = (int64_t)lroundf(h * 10.0f) + cfg.hum_off_x10;
+      int64_t px = (int64_t)lroundf(p) + cfg.pres_off_pa;
       s.temp_x10 = sat_i32(tx, -400, 850);
       s.hum_x10 = sat_i32(hx, 0, 1000);
       s.pres_pa = sat_i32(px, 30000, 110000);
@@ -544,7 +594,7 @@ static void sample_tick() {
   if (g_bh_ok) {
     float l = g_bh.readLightLevel();
     if (!isnan(l) && l >= 0.0f) {
-      int64_t lx = (int64_t)lroundf(l * 10.0f) + g_cfg.lux_off_x10;
+      int64_t lx = (int64_t)lroundf(l * 10.0f) + cfg.lux_off_x10;
       s.lux_x10 = sat_i32(lx, 0, 2000000);
       s.bh_ok = 1;
     }
@@ -557,15 +607,27 @@ static void sample_tick() {
   s.soil_adc = soil;
   s.rain_adc = rain;
 
-  s.mq2_pct  = pct_from(mq2,  g_cfg.mq2_clean,  g_cfg.mq2_dirty);
-  s.soil_pct = pct_from(soil, g_cfg.soil_dry,   g_cfg.soil_wet);
-  s.rain_pct = pct_from(rain, g_cfg.rain_dry,   g_cfg.rain_wet);
+  bool soil_ok = (soil > 20 && soil < (uint16_t)(ADC_MAX - 20));
+  bool mq2_ok  = (mq2  > 20 && mq2  < (uint16_t)(ADC_MAX - 20));
+  bool rain_ok = (rain > 20 && rain < (uint16_t)(ADC_MAX - 20));
 
-  relay_update(soil, mq2, s.rain_pct);
+  s.mq2_pct  = pct_from(mq2,  cfg.mq2_clean,  cfg.mq2_dirty);
+  s.soil_pct = pct_from(soil, cfg.soil_dry,   cfg.soil_wet);
+  s.rain_pct = pct_from(rain, cfg.rain_dry,   cfg.rain_wet);
+
+  bool rule_input_ok = true;
+  if (cfg.relay_mode == 1) {
+    if (cfg.relay_rule == 0 || cfg.relay_rule == 1) rule_input_ok = soil_ok;
+    else if (cfg.relay_rule == 2)                  rule_input_ok = mq2_ok;
+    else if (cfg.relay_rule == 3)                  rule_input_ok = rain_ok;
+  }
+
+  relay_update(cfg, soil, mq2, s.rain_pct, rule_input_ok);
 
   portENTER_CRITICAL(&g_relay_mux);
   s.relay_on = g_relay_state ? 1 : 0;
   portEXIT_CRITICAL(&g_relay_mux);
+  s.adc_fault = (soil_ok ? 0 : 1) | (mq2_ok ? 0 : 2) | (rain_ok ? 0 : 4);
   s.valid = 1;
 
   portENTER_CRITICAL(&g_snap_mux);
@@ -781,7 +843,8 @@ static String page_dashboard() {
        "<div class='sub'><span class='badge' id='Relb'>--</span></div>"
        "<div class='row' style='margin-top:10px'>"
        "<button class='btn ghost' onclick='SR(\"on\")'>On</button>"
-       "<button class='btn ghost' onclick='SR(\"off\")'>Off</button>"
+       "<button class='btn ghost' onclick='SR(\"off\")'>Force Off</button>"
+       "<button class='btn ghost' onclick='SR(\"disable\")'>Disable</button>"
        "<button class='btn ghost' onclick='SR(\"auto\")'>Auto</button>"
        "</div></div>";
 
@@ -819,7 +882,16 @@ static String page_dashboard() {
        "document.getElementById('Hs').textContent='BME280 '+(d.bme?'OK':'FAIL');"
        "document.getElementById('Ps').textContent='BME280 '+(d.bme?'OK':'FAIL');"
        "document.getElementById('Ls').textContent='BH1750 '+(d.bh?'OK':'FAIL');"
-       "} else {document.getElementById('T').textContent='--';}"
+       "var ft=d.fault||0;"
+       "document.getElementById('Sa').textContent=d.soil+(ft&1?' (FAULT)':'');"
+       "document.getElementById('Ma').textContent=d.mq2 +(ft&2?' (FAULT)':'');"
+       "document.getElementById('Ra').textContent=d.rain+(ft&4?' (FAULT)':'');"
+       "} else {"
+       "['T','H','P','L','M','S','R'].forEach(function(id){"
+       "document.getElementById(id).textContent='--';});"
+       "['Ts','Hs','Ps','Ls'].forEach(function(id){"
+       "document.getElementById(id).textContent='waiting';});"
+       "}"
        "document.getElementById('up').textContent='Up '+fmtup(d.uptime);"
        "}"
        "function poll(){G('/api/data').then(paint).catch(()=>{});}"
@@ -906,7 +978,9 @@ static String page_settings() {
        "var fd=new FormData(f);var b=new URLSearchParams();"
        "fd.forEach((v,k)=>b.append(k,v));"
        "F('/api/settings',b.toString()).then(j=>{"
-       "if(j&&j.ok)T('Saved','ok');else T((j&&j.err)||'failed','err');});return false;}"
+       "if(j&&j.ok)T('Saved','ok');"
+       "else T((j&&j.fields)?('Bad: '+j.fields):((j&&j.err)||'failed'),'err');"
+       "});return false;}"
        "LD();";
   s += "</script>";
   s += html_tail();
@@ -1040,6 +1114,7 @@ static void h_api_data() {
   j += F(",\"bme\":");      j += s.bme_ok ? F("true") : F("false");
   j += F(",\"bh\":");       j += s.bh_ok ? F("true") : F("false");
   j += F(",\"relay\":");    j += s.relay_on ? F("true") : F("false");
+  j += F(",\"fault\":");    j += String((unsigned)s.adc_fault);
   j += F(",\"uptime\":");   j += String((unsigned long)uptime_s);
   j += F("}");
   g_server.sendHeader("Cache-Control", "no-store");
@@ -1129,39 +1204,62 @@ static void h_api_settings() {
   portEXIT_CRITICAL(&g_cfg_mux);
 
   uint32_t u; int32_t i;
-  if (g_server.hasArg("soil_dry") && parse_u32(g_server.arg("soil_dry"), u)) n.soil_dry = u;
-  if (g_server.hasArg("soil_wet") && parse_u32(g_server.arg("soil_wet"), u)) n.soil_wet = u;
-  if (g_server.hasArg("mq2_clean") && parse_u32(g_server.arg("mq2_clean"), u)) n.mq2_clean = u;
-  if (g_server.hasArg("mq2_dirty") && parse_u32(g_server.arg("mq2_dirty"), u)) n.mq2_dirty = u;
-  if (g_server.hasArg("rain_dry") && parse_u32(g_server.arg("rain_dry"), u)) n.rain_dry = u;
-  if (g_server.hasArg("rain_wet") && parse_u32(g_server.arg("rain_wet"), u)) n.rain_wet = u;
-  if (g_server.hasArg("temp_off") && parse_i32(g_server.arg("temp_off"), i)) n.temp_off_x10 = i;
-  if (g_server.hasArg("hum_off") && parse_i32(g_server.arg("hum_off"), i)) n.hum_off_x10 = i;
-  if (g_server.hasArg("pres_off") && parse_i32(g_server.arg("pres_off"), i)) n.pres_off_pa = i;
-  if (g_server.hasArg("lux_off") && parse_i32(g_server.arg("lux_off"), i)) n.lux_off_x10 = i;
-  if (g_server.hasArg("relay_mode") && parse_u32(g_server.arg("relay_mode"), u)) n.relay_mode = u;
-  if (g_server.hasArg("relay_rule") && parse_u32(g_server.arg("relay_rule"), u)) n.relay_rule = u;
-  if (g_server.hasArg("relay_thr") && parse_u32(g_server.arg("relay_thr"), u)) n.relay_threshold = u;
-  if (g_server.hasArg("relay_rain") && parse_u32(g_server.arg("relay_rain"), u)) n.relay_rain_pct = u;
-  if (g_server.hasArg("relay_ms") && parse_u32(g_server.arg("relay_ms"), u)) n.relay_min_on_ms = u;
-  if (g_server.hasArg("relay_inv") && parse_u32(g_server.arg("relay_inv"), u)) n.relay_invert = u;
-  if (g_server.hasArg("sample_ms") && parse_u32(g_server.arg("sample_ms"), u)) n.sample_interval_ms = u;
+  String bad;
+  auto PU = [&](const char* k, uint32_t& dst) {
+    if (!g_server.hasArg(k)) return;
+    if (parse_u32(g_server.arg(k), u)) dst = u;
+    else { if (bad.length()) bad += ','; bad += k; }
+  };
+  auto PI = [&](const char* k, int32_t& dst) {
+    if (!g_server.hasArg(k)) return;
+    if (parse_i32(g_server.arg(k), i)) dst = i;
+    else { if (bad.length()) bad += ','; bad += k; }
+  };
+
+  PU("soil_dry",   n.soil_dry);
+  PU("soil_wet",   n.soil_wet);
+  PU("mq2_clean",  n.mq2_clean);
+  PU("mq2_dirty",  n.mq2_dirty);
+  PU("rain_dry",   n.rain_dry);
+  PU("rain_wet",   n.rain_wet);
+  PI("temp_off",   n.temp_off_x10);
+  PI("hum_off",    n.hum_off_x10);
+  PI("pres_off",   n.pres_off_pa);
+  PI("lux_off",    n.lux_off_x10);
+  PU("relay_mode", n.relay_mode);
+  PU("relay_rule", n.relay_rule);
+  PU("relay_thr",  n.relay_threshold);
+  PU("relay_rain", n.relay_rain_pct);
+  PU("relay_ms",   n.relay_min_on_ms);
+  PU("relay_inv",  n.relay_invert);
+  PU("sample_ms",  n.sample_interval_ms);
 
   cfg_sanitize(n);
+
+  if (bad.length()) {
+    String j = F("{\"ok\":false,\"err\":\"bad_field\",\"fields\":\"");
+    j += bad;
+    j += F("\"}");
+    g_server.sendHeader("Cache-Control", "no-store");
+    g_server.send(200, "application/json", j);
+    return;
+  }
+
   portENTER_CRITICAL(&g_cfg_mux);
   g_cfg = n;
   portEXIT_CRITICAL(&g_cfg_mux);
   nvs_mark_dirty();
 
   uint64_t now_ms = millis64();
-  bool ok = true;
   if (g_last_save_ms == 0 || (now_ms - g_last_save_ms) >= NVS_SAVE_USER_COOLDOWN_MS) {
-    ok = nvs_save();
+    bool saved = nvs_save();
+    g_server.sendHeader("Cache-Control", "no-store");
+    if (saved) g_server.send(200, "application/json", "{\"ok\":true}");
+    else       g_server.send(200, "application/json", "{\"ok\":false,\"err\":\"nvs\"}");
+  } else {
+    g_server.sendHeader("Cache-Control", "no-store");
+    g_server.send(200, "application/json", "{\"ok\":true,\"deferred\":true}");
   }
-
-  g_server.sendHeader("Cache-Control", "no-store");
-  if (ok) g_server.send(200, "application/json", "{\"ok\":true}");
-  else    g_server.send(200, "application/json", "{\"ok\":false,\"err\":\"nvs\"}");
 }
 
 static void h_api_wifi() {
@@ -1202,11 +1300,15 @@ static void h_api_wifi() {
   portEXIT_CRITICAL(&g_cfg_mux);
 
   nvs_mark_dirty();
-  nvs_save();
+  bool saved = nvs_save();
   g_server.sendHeader("Cache-Control", "no-store");
-  g_server.send(200, "application/json", "{\"ok\":true}");
-  delay(REBOOT_FLUSH_MS);
-  g_reboot_req = true;
+  if (saved) {
+    g_server.send(200, "application/json", "{\"ok\":true}");
+    delay(REBOOT_FLUSH_MS);
+    g_reboot_req = true;
+  } else {
+    g_server.send(200, "application/json", "{\"ok\":false,\"err\":\"nvs\"}");
+  }
 }
 
 static void h_api_clients() {
@@ -1238,13 +1340,16 @@ static void h_api_relay() {
   if (g_server.method() != HTTP_POST) { g_server.send(405, "text/plain", ""); return; }
   String a = g_server.arg("a");
   uint32_t mode;
-  if (a == "on")        mode = 2;
-  else if (a == "off")  mode = 3;
-  else if (a == "auto") mode = 1;
+  if (a == "on")           mode = 2;
+  else if (a == "off")     mode = 3;
+  else if (a == "auto")    mode = 1;
+  else if (a == "disable") mode = 0;
   else { g_server.send(200, "application/json", "{\"ok\":false,\"err\":\"bad\"}"); return; }
 
+  Config cfg;
   portENTER_CRITICAL(&g_cfg_mux);
   g_cfg.relay_mode = mode;
+  cfg = g_cfg;
   portEXIT_CRITICAL(&g_cfg_mux);
   nvs_mark_dirty();
 
@@ -1252,7 +1357,14 @@ static void h_api_relay() {
   portENTER_CRITICAL(&g_snap_mux);
   snap = g_snap;
   portEXIT_CRITICAL(&g_snap_mux);
-  relay_update(snap.soil_adc, snap.mq2_adc, snap.rain_pct);
+
+  bool snap_ok = true;
+  if (cfg.relay_mode == 1) {
+    if (cfg.relay_rule == 0 || cfg.relay_rule == 1) snap_ok = !(snap.adc_fault & 1);
+    else if (cfg.relay_rule == 2)                  snap_ok = !(snap.adc_fault & 2);
+    else if (cfg.relay_rule == 3)                  snap_ok = !(snap.adc_fault & 4);
+  }
+  relay_update(cfg, snap.soil_adc, snap.mq2_adc, snap.rain_pct, snap_ok);
 
   g_server.sendHeader("Cache-Control", "no-store");
   g_server.send(200, "application/json", "{\"ok\":true}");
@@ -1364,7 +1476,11 @@ static void do_factory_reset() {
 }
 
 static void do_reboot() {
-  if (g_cfg_dirty) nvs_save();
+  bool dirty;
+  portENTER_CRITICAL(&g_cfg_mux);
+  dirty = g_cfg_dirty;
+  portEXIT_CRITICAL(&g_cfg_mux);
+  if (dirty) nvs_save();
   if (g_dns_up) { g_dns.stop(); g_dns_up = false; }
   g_server.stop();
   delay(200);
@@ -1395,9 +1511,9 @@ void setup() {
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
-  pinMode(PIN_MQ2, INPUT);
-  pinMode(PIN_SOIL, INPUT);
-  pinMode(PIN_RAIN, INPUT);
+  pinMode(PIN_MQ2,  INPUT_PULLUP);
+  pinMode(PIN_SOIL, INPUT_PULLUP);
+  pinMode(PIN_RAIN, INPUT_PULLUP);
 
   bool loaded = nvs_load();
 
