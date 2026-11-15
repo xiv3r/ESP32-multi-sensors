@@ -361,12 +361,17 @@ static void nvs_tick() {
   }
 }
 
-static void nvs_wipe() {
-  Preferences p;
-  if (p.begin(NVS_NAMESPACE, false)) {
-    p.clear();
-    p.end();
+static bool nvs_wipe() {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    Preferences p;
+    if (p.begin(NVS_NAMESPACE, false)) {
+      bool ok = p.clear();
+      p.end();
+      if (ok) return true;
+    }
+    delay(50);
   }
+  return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -505,13 +510,18 @@ static void sample_tick() {
   if ((now - g_last_sample_us) < (uint64_t)interval_ms * 1000ULL) return;
   g_last_sample_us = now;
 
+  bool bus_recovered_this_tick = false;
+
   if (!g_bme_ok) {
     g_bme_fail++;
     if (g_bme_fail > 3) {
       uint64_t now_ms = millis64();
       if (g_bme_recover_ms == 0 || (now_ms - g_bme_recover_ms) >= I2C_RECOVER_MIN_GAP_MS) {
-        i2c_bus_recover();
-        i2c_init();
+        if (!bus_recovered_this_tick) {
+          i2c_bus_recover();
+          i2c_init();
+          bus_recovered_this_tick = true;
+        }
         g_bme_recover_ms = now_ms;
       }
       g_bme_fail = 0;
@@ -523,8 +533,11 @@ static void sample_tick() {
     if (g_bh_fail > 3) {
       uint64_t now_ms = millis64();
       if (g_bh_recover_ms == 0 || (now_ms - g_bh_recover_ms) >= I2C_RECOVER_MIN_GAP_MS) {
-        i2c_bus_recover();
-        i2c_init();
+        if (!bus_recovered_this_tick) {
+          i2c_bus_recover();
+          i2c_init();
+          bus_recovered_this_tick = true;
+        }
         g_bh_recover_ms = now_ms;
       }
       g_bh_fail = 0;
@@ -559,7 +572,7 @@ static void sample_tick() {
       int64_t lx = (int64_t)lroundf(l * 10.0f) + g_cfg.lux_off_x10;
       s.lux_x10 = sat_i32(lx, 0, 2000000);
       s.bh_ok = 1;
-    } else if (isnan(l)) {
+    } else {
       g_bh_ok = false;
     }
   }
@@ -833,7 +846,35 @@ static String page_dashboard() {
        "document.getElementById('Hs').textContent='BME280 '+(d.bme?'OK':'FAIL');"
        "document.getElementById('Ps').textContent='BME280 '+(d.bme?'OK':'FAIL');"
        "document.getElementById('Ls').textContent='BH1750 '+(d.bh?'OK':'FAIL');"
-       "} else {document.getElementById('T').textContent='--';}"
+       "} else {"
+       "document.getElementById('T').textContent='--';"
+       "document.getElementById('H').textContent='--';"
+       "document.getElementById('P').textContent='--';"
+       "document.getElementById('L').textContent='--';"
+       "document.getElementById('M').textContent='--';"
+       "document.getElementById('Ma').textContent='--';"
+       "document.getElementById('S').textContent='--';"
+       "document.getElementById('Sa').textContent='--';"
+       "document.getElementById('R').textContent='--';"
+       "document.getElementById('Ra').textContent='--';"
+       "document.getElementById('Rel').textContent='--';"
+       "var rb=document.getElementById('Relb');"
+       "rb.textContent='--';"
+       "rb.className='badge';"
+       "var mb=document.getElementById('Mb');"
+       "mb.className='bar';"
+       "mb.firstElementChild.style.width='0%';"
+       "var sb=document.getElementById('Sb');"
+       "sb.className='bar';"
+       "sb.firstElementChild.style.width='0%';"
+       "var rb2=document.getElementById('Rb');"
+       "rb2.className='bar';"
+       "rb2.firstElementChild.style.width='0%';"
+       "document.getElementById('Ts').textContent='waiting';"
+       "document.getElementById('Hs').textContent='waiting';"
+       "document.getElementById('Ps').textContent='waiting';"
+       "document.getElementById('Ls').textContent='waiting';"
+       "}"
        "document.getElementById('up').textContent='Up '+fmtup(d.uptime);"
        "}"
        "function poll(){G('/api/data').then(paint).catch(()=>{});}"
@@ -1018,15 +1059,21 @@ static void h_wifi()     { g_server.send(200, "text/html; charset=utf-8", page_w
 static void h_system()   { g_server.send(200, "text/html; charset=utf-8", page_system()); }
 
 static void h_redirect_root() {
-  g_server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+  String url = String("http://") + WiFi.softAPIP().toString() + "/";
+  g_server.sendHeader("Location", url);
   g_server.send(302, "text/plain", "");
 }
 
 static void h_not_found() {
   String host = g_server.hostHeader();
-  if (host.length() != 0 && host == WiFi.softAPIP().toString()) {
-    g_server.send(404, "text/plain", "not found");
-    return;
+  String ap   = WiFi.softAPIP().toString();
+  if (host.length() != 0) {
+    int colon = host.indexOf(':');
+    if (colon >= 0) host = host.substring(0, colon);
+    if (host == ap) {
+      g_server.send(404, "text/plain", "not found");
+      return;
+    }
   }
   h_redirect_root();
 }
@@ -1091,6 +1138,14 @@ static bool parse_i32(const String& s, int32_t& out) {
   }
   out = (int32_t)(neg ? -(int64_t)v : (int64_t)v);
   return true;
+}
+
+static bool has_ctrl_or_nul(const String& s) {
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    if (c < 0x20 || c == 0x7F) return true;
+  }
+  return false;
 }
 
 static void json_escape_into(String& out, const char* s) {
@@ -1208,11 +1263,11 @@ static void h_api_wifi() {
 
   String ssid = g_server.arg("ssid");
   String pass = g_server.arg("pass");
-  if (ssid.length() < 1 || ssid.length() > 32) {
+  if (ssid.length() < 1 || ssid.length() > 32 || has_ctrl_or_nul(ssid)) {
     g_server.send(200, "application/json", "{\"ok\":false,\"err\":\"ssid_len\"}");
     return;
   }
-  if (pass.length() < 8 || pass.length() > 63) {
+  if (pass.length() < 8 || pass.length() > 63 || has_ctrl_or_nul(pass)) {
     g_server.send(200, "application/json", "{\"ok\":false,\"err\":\"pass_len\"}");
     return;
   }
@@ -1225,7 +1280,11 @@ static void h_api_wifi() {
   portEXIT_CRITICAL(&g_cfg_mux);
 
   nvs_mark_dirty();
-  nvs_save();
+  if (!nvs_save()) {
+    g_server.sendHeader("Cache-Control", "no-store");
+    g_server.send(200, "application/json", "{\"ok\":false,\"err\":\"nvs\"}");
+    return;
+  }
   g_server.sendHeader("Cache-Control", "no-store");
   g_server.send(200, "application/json", "{\"ok\":true}");
   delay(REBOOT_FLUSH_MS);
@@ -1266,7 +1325,9 @@ static void h_api_relay() {
   else if (a == "auto") mode = 1;
   else { g_server.send(200, "application/json", "{\"ok\":false,\"err\":\"bad\"}"); return; }
 
+  bool mode_changed = false;
   portENTER_CRITICAL(&g_cfg_mux);
+  mode_changed = (g_cfg.relay_mode != mode);
   g_cfg.relay_mode = mode;
   portEXIT_CRITICAL(&g_cfg_mux);
   nvs_mark_dirty();
@@ -1276,6 +1337,8 @@ static void h_api_relay() {
   snap = g_snap;
   portEXIT_CRITICAL(&g_snap_mux);
   relay_update(snap.soil_adc, snap.mq2_adc, snap.rain_pct);
+
+  if (mode_changed) nvs_save();
 
   g_server.sendHeader("Cache-Control", "no-store");
   g_server.send(200, "application/json", "{\"ok\":true}");
@@ -1345,6 +1408,14 @@ static void ap_start() {
     strncpy(ssid, DEF_AP_SSID, sizeof(ssid) - 1);
     strncpy(pass, DEF_AP_PASS, sizeof(pass) - 1);
     ap_ok = WiFi.softAP(ssid, pass, AP_CHANNEL, AP_HIDDEN, AP_MAX_CLIENTS);
+    if (ap_ok) {
+      portENTER_CRITICAL(&g_cfg_mux);
+      memcpy(g_cfg.ap_ssid, ssid, sizeof(g_cfg.ap_ssid));
+      memcpy(g_cfg.ap_pass, pass, sizeof(g_cfg.ap_pass));
+      portEXIT_CRITICAL(&g_cfg_mux);
+      nvs_mark_dirty();
+      nvs_save();
+    }
   }
   delay(50);
 
@@ -1406,7 +1477,6 @@ static void do_reboot() {
 /* Setup / Loop                                                       */
 /* ------------------------------------------------------------------ */
 void setup() {
-  pinMode(PIN_RELAY, OUTPUT);
   {
     Preferences p;
     uint32_t inv = 0;
@@ -1420,6 +1490,7 @@ void setup() {
       p.end();
     }
     digitalWrite(PIN_RELAY, inv ? HIGH : LOW);
+    pinMode(PIN_RELAY, OUTPUT);
   }
 
   pinMode(PIN_BOOT, INPUT_PULLUP);
